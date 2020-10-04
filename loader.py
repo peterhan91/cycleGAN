@@ -18,16 +18,13 @@ class ImageDataset(Dataset):
 
     def __getitem__(self, index):
         item_A = self.transform(Image.open(self.files_A[index % len(self.files_A)]).convert('RGB'))
-
-        if self.unaligned:
-            # item_B = self.transform(Image.open(self.files_B[random.randint(0, len(self.files_B) - 1)]))
+        item_B = np.float32(np.load(self.files_B[random.randint(0, len(self.files_B) - 1)] + '/128x128.npy'))
+        while not item_B.shape == (128, 128, 128):
             item_B = np.float32(np.load(self.files_B[random.randint(0, len(self.files_B) - 1)] + '/128x128.npy'))
-        else:
-            # item_B = self.transform(Image.open(self.files_B[index % len(self.files_B)]))
-            item_B = np.float32(np.load(self.files_B[index % len(self.files_B)] + '/128x128.npy'))
+        item_B = np.moveaxis(np.flipud(item_B), 1, 0)
 
         return {'A': item_A, 
-                'B': torch.from_numpy(item_B).type(torch.FloatTensor)}
+                'B': torch.from_numpy(np.expand_dims(item_B.copy(), axis=0)).type(torch.FloatTensor)}
 
     def __len__(self):
         return max(len(self.files_A), len(self.files_B))

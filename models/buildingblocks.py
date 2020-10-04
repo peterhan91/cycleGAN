@@ -37,11 +37,11 @@ def create_conv(in_channels, out_channels, kernel_size, kernel_type, order, padd
     modules = []
     for i, char in enumerate(order):
         if char == 'r':
-            modules.append(('ReLU', nn.ReLU(inplace=True)))
+            modules.append(('ReLU', nn.ReLU()))
         elif char == 'l':
-            modules.append(('LeakyReLU', nn.LeakyReLU(negative_slope=0.1, inplace=True)))
+            modules.append(('LeakyReLU', nn.LeakyReLU(negative_slope=0.1)))
         elif char == 'e':
-            modules.append(('ELU', nn.ELU(inplace=True)))
+            modules.append(('ELU', nn.ELU()))
         elif char == 'c':
             # add learnable bias only in the absence of batchnorm/groupnorm
             bias = not ('i' in order or 'b' in order)
@@ -54,14 +54,14 @@ def create_conv(in_channels, out_channels, kernel_size, kernel_type, order, padd
             is_before_conv = i < order.index('c')
             if kernel_type == '2d':
                 if is_before_conv:
-                    modules.append(('instancenorm', nn.InstanceNorm2d(in_channels, affine=True)))
+                    modules.append(('instancenorm', nn.InstanceNorm2d(in_channels)))
                 else:
-                    modules.append(('instancenorm', nn.InstanceNorm2d(out_channels, affine=True)))
+                    modules.append(('instancenorm', nn.InstanceNorm2d(out_channels)))
             elif kernel_type == '3d':
                 if is_before_conv:
-                    modules.append(('instancenorm', nn.InstanceNorm3d(in_channels, affine=True)))
+                    modules.append(('instancenorm', nn.InstanceNorm3d(in_channels)))
                 else:
-                    modules.append(('instancenorm', nn.InstanceNorm3d(out_channels, affine=True)))
+                    modules.append(('instancenorm', nn.InstanceNorm3d(out_channels)))
         elif char == 'b':
             is_before_conv = i < order.index('c')
             if kernel_type == '2d':
@@ -212,18 +212,43 @@ class Skipconnection(nn.Module):
 
     def forward(self, x):
         if self.kernel_type == '3d':
-            x_ = self._inflate(x)
-            x_ = self.conv(x_)
+            x = self._inflate(x)
+            x = self.conv(x)
         elif self.kernel_type == '2d':
-            x_ = self.pool(x)
-            x_ = torch.squeeze(x_)
-        return x_
+            x = self.pool(x)
+            x = torch.squeeze(x, 2)
+        return x
 
     @staticmethod
     def _inflate(x):
-        _ = x.unsqueeze_(-1)
-        x_ = x.repeat(1,1,1,1,x.shape[-1])
-        return x_.transpose(-1, 2) 
+        x = x.unsqueeze(-1)
+        x_ = x.repeat(1,1,1,1,x.shape[-2])
+        out = x_.permute(0, 1, 4, 2, 3)
+        return out
+
+class Transition(nn.Module):
+    def __init__(self, in_channels, kernel_type='3d'):
+        super(Transition, self).__init__()
+        self.kernel_type = kernel_type
+        self.in_channels = in_channels
+        if kernel_type == '3d':
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.dense = nn.Linear(in_channels, in_channels*4*4*4)
+            self.dropout = nn.Dropout(p=0.3)
+
+        if kernel_type == '2d':
+            self.pool = nn.AdaptiveAvgPool3d((1, None, None))
+
+    def forward(self, x):
+        if self.kernel_type == '3d':
+            x = torch.squeeze(self.pool(x))
+            x = F.relu(self.dense(x))
+            x = self.dropout(x)
+            x = x.view(-1, self.in_channels, 4, 4, 4)
+        elif self.kernel_type == '2d':
+            x = self.pool(x)
+            x = torch.squeeze(x, 2)
+        return x 
 
 class Encoder(nn.Module):
     """
@@ -251,10 +276,16 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__()
         assert pool_type in ['max', 'avg']
         if apply_pooling:
-            if pool_type == 'max':
-                self.pooling = nn.MaxPool3d(kernel_size=pool_kernel_size)
-            else:
-                self.pooling = nn.AvgPool3d(kernel_size=pool_kernel_size)
+            if conv_kernel_type == '3d':
+                if pool_type == 'max':
+                    self.pooling = nn.MaxPool3d(kernel_size=pool_kernel_size, stride=2)
+                else:
+                    self.pooling = nn.AvgPool3d(kernel_size=pool_kernel_size, stride=2)
+            elif conv_kernel_type == '2d':
+                if pool_type == 'max':
+                    self.pooling = nn.MaxPool2d(kernel_size=pool_kernel_size, stride=2)
+                else:
+                    self.pooling = nn.AvgPool2d(kernel_size=pool_kernel_size, stride=2)
         else:
             self.pooling = None
 
@@ -266,10 +297,13 @@ class Encoder(nn.Module):
                                          padding=padding)
 
     def forward(self, x):
-        if self.pooling is not None:
-            x = self.pooling(x)
-        x = self.basic_module(x)
-        return x
+        with torch.autograd.set_detect_anomaly(True):
+            if self.pooling is not None:
+                x = self.pooling(x)
+            # print('before: ', x.shape)
+            x = self.basic_module(x)
+            # print('after: ', x.shape)
+            return x
 
 
 class Decoder(nn.Module):
@@ -289,15 +323,16 @@ class Decoder(nn.Module):
         padding (int or tuple): add zero-padding added to all three sides of the input
     """
 
-    def __init__(self, in_channels, out_channels, conv_kernel_size=3, conv_kernel_type='2d', scale_factor=(2, 2, 2), 
+    def __init__(self, in_channels, out_channels, conv_kernel_size=3, conv_kernel_type='2d', scale_factor=2, 
                  basic_module=DoubleConv, conv_layer_order='icr', mode='nearest', padding=1):
         super(Decoder, self).__init__()
         if basic_module == DoubleConv:
             # if DoubleConv is the basic_module use interpolation for upsampling and concatenation joining
-            self.upsampling = Upsampling(transposed_conv=False, in_channels=in_channels, out_channels=out_channels,
+            self.upsampling = Upsampling(transposed_conv=True, in_channels=in_channels, out_channels=in_channels,
                                          kernel_size=conv_kernel_size, kernel_type=conv_kernel_type, scale_factor=scale_factor, mode=mode)
             # concat joining
             self.joining = partial(self._joining, concat=True)
+            in_channels = in_channels + out_channels
         else:
             # if basic_module=ExtResNetBlock use transposed convolution upsampling and summation joining
             self.upsampling = Upsampling(transposed_conv=True, in_channels=in_channels, out_channels=out_channels,
@@ -310,16 +345,21 @@ class Decoder(nn.Module):
         self.basic_module = basic_module(in_channels, out_channels,
                                          encoder=False,
                                          kernel_size=conv_kernel_size,
+                                         kernel_type=conv_kernel_type,
                                          order=conv_layer_order,
                                          padding=padding)
-        self.skip = Skipconnection(in_channels, out_channels,
+        self.skip = Skipconnection(out_channels, out_channels,
                                     kernel_type=conv_kernel_type)
 
     def forward(self, encoder_features, x):
-        x = self.upsampling(x)
-        x = self.joining(self.skip(encoder_features), x)
-        x = self.basic_module(x)
-        return x
+        with torch.autograd.set_detect_anomaly(True):
+            # print('before decode: ', x.shape)
+            x = self.upsampling(x)
+            encoder_features = self.skip(encoder_features)
+            x = self.joining(encoder_features, x)
+            x = self.basic_module(x)
+            # print('after decode: ', x.shape)
+            return x
        
     @staticmethod
     def _joining(encoder_features, x, concat):

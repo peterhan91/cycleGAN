@@ -1,7 +1,7 @@
 import importlib
 import torch.nn as nn
 import torch.nn.functional as F
-from buildingblocks import Encoder, Decoder, SingleConv, DoubleConv, ExtResNetBlock, Skipconnection
+from models.buildingblocks import Encoder, Decoder, SingleConv, DoubleConv, ExtResNetBlock, Skipconnection, Transition
 
 def number_of_features_per_level(init_channel_number, num_levels):
     return [init_channel_number * 2 ** k for k in range(num_levels)]
@@ -75,18 +75,16 @@ class Abstract3DUNet(nn.Module):
         self.encoders = nn.ModuleList(encoders)
 
         # the connection between encoder and decoder
-        self.connect = Skipconnection(f_maps[-1], f_maps[-1],
-                                    kernel_type=de_kernel_type)
+        self.connect = Skipconnection(f_maps[-1], f_maps[-1], kernel_type=de_kernel_type)
 
         # create decoder path consisting of the Decoder modules. The length of the decoder is equal to `len(f_maps) - 1`
         decoders = []
         reversed_f_maps = list(reversed(f_maps))
         for i in range(len(reversed_f_maps) - 1):
-            if basic_module == DoubleConv:
-                in_feature_num = reversed_f_maps[i] + reversed_f_maps[i + 1]
-            else:
-                in_feature_num = reversed_f_maps[i]
-
+            # if basic_module == DoubleConv:
+            #     in_feature_num = reversed_f_maps[i] + reversed_f_maps[i + 1]
+            # else:
+            in_feature_num = reversed_f_maps[i]
             out_feature_num = reversed_f_maps[i + 1]
             # TODO: if non-standard pooling was used, make sure to use correct striding for transpose conv
             # currently strides with a constant stride: (2, 2, 2)
@@ -104,7 +102,7 @@ class Abstract3DUNet(nn.Module):
         # channels to the number of labels
         # self.final_conv = nn.Conv3d(f_maps[0], out_channels, 1)
         self.final_conv = SingleConv(f_maps[0], out_channels, kernel_size=1, 
-                                    kernel_type=de_kernel_type, order='c')
+                                    kernel_type=de_kernel_type, order='c', padding=0)
 
         if is_segmentation:
             # semantic segmentation problem
@@ -114,7 +112,7 @@ class Abstract3DUNet(nn.Module):
                 self.final_activation = nn.Softmax(dim=1)
         else:
             # regression problem
-            self.final_activation = None
+            self.final_activation = nn.Tanh()
 
     def forward(self, x):
         # encoder part
@@ -141,14 +139,14 @@ class Abstract3DUNet(nn.Module):
 
         # apply final_activation (i.e. Sigmoid or Softmax) only during prediction. During training the network outputs
         # logits and it's up to the user to normalize it before visualising with tensorboard or computing validation metric
-        if self.testing and self.final_activation is not None:
+        if self.testing or self.final_activation is not None:
             x = self.final_activation(x)
 
         return x
 
 
 class Generator2Dto3D(Abstract3DUNet):
-    def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=64, layer_order='icr',
+    def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=16, layer_order='icr',
                  num_levels=4, is_segmentation=False, conv_padding=1, **kwargs):
         super(Generator2Dto3D, self).__init__(in_channels=in_channels, out_channels=out_channels, final_sigmoid=final_sigmoid,
                                      en_kernel_type='2d', de_kernel_type='3d',
@@ -157,7 +155,7 @@ class Generator2Dto3D(Abstract3DUNet):
                                      conv_padding=conv_padding, **kwargs)
 
 class Generator3Dto2D(Abstract3DUNet):
-    def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=64, layer_order='icr',
+    def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=16, layer_order='icr',
                  num_levels=4, is_segmentation=False, conv_padding=1, **kwargs):
         super(Generator3Dto2D, self).__init__(in_channels=in_channels, out_channels=out_channels, final_sigmoid=final_sigmoid,
                                      en_kernel_type='3d', de_kernel_type='2d',
@@ -168,62 +166,64 @@ class Generator3Dto2D(Abstract3DUNet):
 class Discriminator2D(nn.Module):
     def __init__(self, input_nc):
         super(Discriminator2D, self).__init__()
-
+        self.base_nc = 32
         # A bunch of convolutions one after another
-        model = [   nn.Conv2d(input_nc, 64, 4, stride=2, padding=1),
-                    nn.LeakyReLU(0.2, inplace=True) ]
+        model = [   nn.Conv2d(input_nc, self.base_nc, 4, stride=2, padding=1),
+                    nn.LeakyReLU(0.2) ]
 
-        model += [  nn.Conv2d(64, 128, 4, stride=2, padding=1),
-                    nn.InstanceNorm2d(128), 
-                    nn.LeakyReLU(0.2, inplace=True) ]
+        model += [  nn.Conv2d(self.base_nc, self.base_nc*2, 4, stride=2, padding=1),
+                    nn.InstanceNorm2d(self.base_nc*2), 
+                    nn.LeakyReLU(0.2) ]
 
-        model += [  nn.Conv2d(128, 256, 4, stride=2, padding=1),
-                    nn.InstanceNorm2d(256), 
-                    nn.LeakyReLU(0.2, inplace=True) ]
+        model += [  nn.Conv2d(self.base_nc*2, self.base_nc*4, 4, stride=2, padding=1),
+                    nn.InstanceNorm2d(self.base_nc*4), 
+                    nn.LeakyReLU(0.2) ]
 
-        model += [  nn.Conv2d(256, 512, 4, padding=1),
-                    nn.InstanceNorm2d(512), 
-                    nn.LeakyReLU(0.2, inplace=True) ]
+        model += [  nn.Conv2d(self.base_nc*4, self.base_nc*8, 4, padding=1),
+                    nn.InstanceNorm2d(self.base_nc*8), 
+                    nn.LeakyReLU(0.2) ]
 
         # FCN classification layer
-        model += [nn.Conv2d(512, 1, 4, padding=1)]
+        model += [nn.Conv2d(self.base_nc*8, 1, 4, padding=1)]
 
         self.model = nn.Sequential(*model)
 
     def forward(self, x):
         x =  self.model(x)
         # Average pooling and flatten
-        return F.avg_pool2d(x, x.size()[2:]).view(x.size()[0], -1)
+        x = F.avg_pool2d(x, x.size()[2:]).view(x.size()[0], -1)
+        return x
 
 class Discriminator3D(nn.Module):
     def __init__(self, input_nc):
         super(Discriminator3D, self).__init__()
-
+        self.base_nc = 32
         # A bunch of convolutions one after another
-        model = [   nn.Conv3d(input_nc, 64, 4, stride=2, padding=1),
-                    nn.LeakyReLU(0.2, inplace=True) ]
+        model = [   nn.Conv3d(input_nc, self.base_nc, 4, stride=2, padding=1),
+                    nn.LeakyReLU(0.2) ]
 
-        model += [  nn.Conv3d(64, 128, 4, stride=2, padding=1),
-                    nn.InstanceNorm3d(128), 
-                    nn.LeakyReLU(0.2, inplace=True) ]
+        model += [  nn.Conv3d(self.base_nc, self.base_nc*2, 4, stride=2, padding=1),
+                    nn.InstanceNorm3d(self.base_nc*2), 
+                    nn.LeakyReLU(0.2) ]
 
-        model += [  nn.Conv3d(128, 256, 4, stride=2, padding=1),
-                    nn.InstanceNorm3d(256), 
-                    nn.LeakyReLU(0.2, inplace=True) ]
+        model += [  nn.Conv3d(self.base_nc*2, self.base_nc*4, 4, stride=2, padding=1),
+                    nn.InstanceNorm3d(self.base_nc*4), 
+                    nn.LeakyReLU(0.2) ]
 
-        model += [  nn.Conv3d(256, 512, 4, padding=1),
-                    nn.InstanceNorm3d(512), 
-                    nn.LeakyReLU(0.2, inplace=True) ]
+        model += [  nn.Conv3d(self.base_nc*4, self.base_nc*8, 4, padding=1),
+                    nn.InstanceNorm3d(self.base_nc*8), 
+                    nn.LeakyReLU(0.2) ]
 
         # FCN classification layer
-        model += [nn.Conv3d(512, 1, 4, padding=1)]
+        model += [nn.Conv3d(self.base_nc*8, 1, 4, padding=1)]
 
         self.model = nn.Sequential(*model)
 
     def forward(self, x):
         x =  self.model(x)
         # Average pooling and flatten
-        return F.avg_pool3d(x, x.size()[2:]).view(x.size()[0], -1)
+        x = F.avg_pool3d(x, x.size()[2:]).view(x.size()[0], -1)
+        return x
 
 class UNet3D(Abstract3DUNet):
     """
