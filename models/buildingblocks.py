@@ -54,14 +54,14 @@ def create_conv(in_channels, out_channels, kernel_size, kernel_type, order, padd
             is_before_conv = i < order.index('c')
             if kernel_type == '2d':
                 if is_before_conv:
-                    modules.append(('instancenorm', nn.InstanceNorm2d(in_channels)))
+                    modules.append(('instancenorm', nn.InstanceNorm2d(in_channels, affine=True)))
                 else:
-                    modules.append(('instancenorm', nn.InstanceNorm2d(out_channels)))
+                    modules.append(('instancenorm', nn.InstanceNorm2d(out_channels, affine=True)))
             elif kernel_type == '3d':
                 if is_before_conv:
-                    modules.append(('instancenorm', nn.InstanceNorm3d(in_channels)))
+                    modules.append(('instancenorm', nn.InstanceNorm3d(in_channels, affine=True)))
                 else:
-                    modules.append(('instancenorm', nn.InstanceNorm3d(out_channels)))
+                    modules.append(('instancenorm', nn.InstanceNorm3d(out_channels, affine=True)))
         elif char == 'b':
             is_before_conv = i < order.index('c')
             if kernel_type == '2d':

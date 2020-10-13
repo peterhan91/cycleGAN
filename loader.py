@@ -12,7 +12,7 @@ class ImageDataset(Dataset):
         self.transform = transforms.Compose(transforms_)
         self.unaligned = unaligned
         # full path list of xrays 
-        self.files_A = sorted(glob.glob(os.path.join(root, '%s/xray' % mode) + '/*.png'))
+        self.files_A = sorted(glob.glob(os.path.join(root, '%s/xray' % mode) + '/*.png'))[1500: 3300]
         # full folder list of cts
         self.files_B = sorted(glob.glob(os.path.join(root, '%s/ct' % mode) + '/*'))
 

@@ -225,59 +225,70 @@ class Discriminator3D(nn.Module):
         x = F.avg_pool3d(x, x.size()[2:]).view(x.size()[0], -1)
         return x
 
-class UNet3D(Abstract3DUNet):
-    """
-    3DUnet model from
-    `"3D U-Net: Learning Dense Volumetric Segmentation from Sparse Annotation"
-        <https://arxiv.org/pdf/1606.06650.pdf>`.
-    Uses `DoubleConv` as a basic_module and nearest neighbor upsampling in the decoder
-    """
+class WDiscriminator2D(nn.Module):
+    def __init__(self, input_nc):
+        super(WDiscriminator2D, self).__init__()
+        self.base_nc = 32
+        # A bunch of convolutions one after another
+        model = [   nn.Conv2d(input_nc, self.base_nc, 4, stride=2, padding=1),
+                    nn.LeakyReLU(0.2) ]
 
-    def __init__(self, in_channels, out_channels, final_sigmoid=True, f_maps=64, layer_order='gcr',
-                 num_levels=4, is_segmentation=True, conv_padding=1, **kwargs):
-        super(UNet3D, self).__init__(in_channels=in_channels, out_channels=out_channels, final_sigmoid=final_sigmoid,
-                                     basic_module=DoubleConv, f_maps=f_maps, layer_order=layer_order,
-                                     num_levels=num_levels, is_segmentation=is_segmentation,
-                                     conv_padding=conv_padding, **kwargs)
+        model += [  nn.Conv2d(self.base_nc, self.base_nc*2, 4, stride=2, padding=1),
+                    nn.InstanceNorm2d(self.base_nc*2), 
+                    nn.LeakyReLU(0.2) ]
 
+        model += [  nn.Conv2d(self.base_nc*2, self.base_nc*4, 4, stride=2, padding=1),
+                    nn.InstanceNorm2d(self.base_nc*4), 
+                    nn.LeakyReLU(0.2) ]
 
-class ResidualUNet3D(Abstract3DUNet):
-    """
-    Residual 3DUnet model implementation based on https://arxiv.org/pdf/1706.00120.pdf.
-    Uses ExtResNetBlock as a basic building block, summation joining instead
-    of concatenation joining and transposed convolutions for upsampling (watch out for block artifacts).
-    Since the model effectively becomes a residual net, in theory it allows for deeper UNet.
-    """
+        model += [  nn.Conv2d(self.base_nc*4, self.base_nc*8, 4, stride=2, padding=1),
+                    nn.InstanceNorm2d(self.base_nc*8), 
+                    nn.LeakyReLU(0.2) ]
 
-    def __init__(self, in_channels, out_channels, final_sigmoid=True, f_maps=64, layer_order='gcr',
-                 num_groups=8, num_levels=5, is_segmentation=True, conv_padding=1, **kwargs):
-        super(ResidualUNet3D, self).__init__(in_channels=in_channels, out_channels=out_channels,
-                                             final_sigmoid=final_sigmoid,
-                                             basic_module=ExtResNetBlock, f_maps=f_maps, layer_order=layer_order,
-                                             num_groups=num_groups, num_levels=num_levels,
-                                             is_segmentation=is_segmentation, conv_padding=conv_padding,
-                                             **kwargs)
+        model += [  nn.Conv2d(self.base_nc*8, self.base_nc*8, 4, stride=2, padding=1),
+                    nn.InstanceNorm2d(self.base_nc*8), 
+                    nn.LeakyReLU(0.2) ]
 
+        # FCN classification layer
+        model += [nn.Conv2d(self.base_nc*8, 1, 4)]
 
-class UNet2D(Abstract3DUNet):
-    """
-    Just a standard 2D Unet. Arises naturally by specifying conv_kernel_size=(1, 3, 3), pool_kernel_size=(1, 2, 2).
-    """
+        self.model = nn.Sequential(*model)
 
-    def __init__(self, in_channels, out_channels, final_sigmoid=True, f_maps=64, layer_order='gcr',
-                 num_groups=8, num_levels=4, is_segmentation=True, conv_padding=1, **kwargs):
-        if conv_padding == 1:
-            conv_padding = (0, 1, 1)
-        super(UNet2D, self).__init__(in_channels=in_channels,
-                                     out_channels=out_channels,
-                                     final_sigmoid=final_sigmoid,
-                                     basic_module=DoubleConv,
-                                     f_maps=f_maps,
-                                     layer_order=layer_order,
-                                     num_groups=num_groups,
-                                     num_levels=num_levels,
-                                     is_segmentation=is_segmentation,
-                                     conv_kernel_size=(1, 3, 3),
-                                     pool_kernel_size=(1, 2, 2),
-                                     conv_padding=conv_padding,
-                                     **kwargs)
+    def forward(self, x):
+        x =  self.model(x)
+        x = x.view(-1)
+        return x
+
+class WDiscriminator3D(nn.Module):
+    def __init__(self, input_nc):
+        super(WDiscriminator3D, self).__init__()
+        self.base_nc = 32
+        # A bunch of convolutions one after another
+        model = [   nn.Conv3d(input_nc, self.base_nc, 4, stride=2, padding=1),
+                    nn.LeakyReLU(0.2) ]
+
+        model += [  nn.Conv3d(self.base_nc, self.base_nc*2, 4, stride=2, padding=1),
+                    nn.InstanceNorm3d(self.base_nc*2), 
+                    nn.LeakyReLU(0.2) ]
+
+        model += [  nn.Conv3d(self.base_nc*2, self.base_nc*4, 4, stride=2, padding=1),
+                    nn.InstanceNorm3d(self.base_nc*4), 
+                    nn.LeakyReLU(0.2) ]
+
+        model += [  nn.Conv3d(self.base_nc*4, self.base_nc*8, 4, stride=2, padding=1),
+                    nn.InstanceNorm3d(self.base_nc*8), 
+                    nn.LeakyReLU(0.2) ]
+
+        model += [  nn.Conv3d(self.base_nc*8, self.base_nc*8, 4, stride=2, padding=1),
+                    nn.InstanceNorm3d(self.base_nc*8), 
+                    nn.LeakyReLU(0.2) ]
+
+        # FCN classification layer
+        model += [nn.Conv3d(self.base_nc*8, 1, 4)]
+
+        self.model = nn.Sequential(*model)
+
+    def forward(self, x):
+        x =  self.model(x)
+        x = x.view(-1)
+        return x

@@ -11,6 +11,10 @@ import torch.nn as nn
 from visdom import Visdom
 import numpy as np
 
+def save_numpy(tensor, name):
+    array = torch.squeeze(tensor).cpu().float().numpy()
+    np.save(name, array)
+
 def tensor2image(tensor):
     image = 127.5*(tensor[0].cpu().float().numpy() + 1.0)
     if image.shape[0] == 1:
@@ -143,11 +147,12 @@ def calc_gradient_penalty(netD, real_data, fake_data, data_dim, batch_size, dim,
     alpha = alpha.expand(batch_size, int(real_data.nelement()/batch_size)).contiguous()
     if data_dim == '2d':
         alpha = alpha.view(batch_size, 3, dim, dim)
+        fake_data = fake_data.view(batch_size, 3, dim, dim)
     elif data_dim == '3d':
         alpha = alpha.view(batch_size, 1, dim, dim, dim)
+        fake_data = fake_data.view(batch_size, 1, dim, dim, dim)
     alpha = alpha.cuda()
     
-    fake_data = fake_data.view(batch_size, 3, dim, dim)
     interpolates = alpha * real_data.detach() + ((1 - alpha) * fake_data.detach())
 
     interpolates = interpolates.cuda()
