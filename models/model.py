@@ -1,7 +1,8 @@
 import importlib
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.buildingblocks import Encoder, Decoder, SingleConv, DoubleConv, ExtResNetBlock, Skipconnection, Transition
+from models.buildingblocks import Encoder, Decoder, SingleConv, DoubleConv, ExtResNetBlock, Skipconnection
 
 def number_of_features_per_level(init_channel_number, num_levels):
     return [init_channel_number * 2 ** k for k in range(num_levels)]
@@ -41,10 +42,11 @@ class Abstract3DUNet(nn.Module):
 
     def __init__(self, in_channels, out_channels, final_sigmoid, basic_module, f_maps=64, layer_order='icr',
                  num_levels=4, is_segmentation=True, testing=False, en_kernel_type='2d', de_kernel_type='3d',
-                 conv_kernel_size=3, pool_kernel_size=2, conv_padding=1, **kwargs):
+                 conv_kernel_size=3, pool_kernel_size=2, conv_padding=1, features_out=None, **kwargs):
         super(Abstract3DUNet, self).__init__()
 
         self.testing = testing
+        self.features_out = features_out
 
         if isinstance(f_maps, int):
             f_maps = number_of_features_per_level(f_maps, num_levels=num_levels)
@@ -113,7 +115,7 @@ class Abstract3DUNet(nn.Module):
         else:
             # regression problem
             self.final_activation = nn.Tanh()
-
+    
     def forward(self, x):
         # encoder part
         encoders_features = []
@@ -134,34 +136,166 @@ class Abstract3DUNet(nn.Module):
             # pass the output from the corresponding encoder and the output
             # of the previous decoder
             x = decoder(encoder_features, x)
+        
+        if self.features_out:
+            return x
+        else:
+            x = self.final_conv(x)
 
-        x = self.final_conv(x)
+            # apply final_activation (i.e. Sigmoid or Softmax) only during prediction. During training the network outputs
+            # logits and it's up to the user to normalize it before visualising with tensorboard or computing validation metric
+            if self.testing or self.final_activation is not None:
+                x = self.final_activation(x)
 
-        # apply final_activation (i.e. Sigmoid or Softmax) only during prediction. During training the network outputs
-        # logits and it's up to the user to normalize it before visualising with tensorboard or computing validation metric
-        if self.testing or self.final_activation is not None:
-            x = self.final_activation(x)
-
-        return x
+            return x
 
 
 class Generator2Dto3D(Abstract3DUNet):
     def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=16, layer_order='icr',
-                 num_levels=4, is_segmentation=False, conv_padding=1, **kwargs):
+                 num_levels=4, is_segmentation=False, conv_padding=1, features_out=False, **kwargs):
         super(Generator2Dto3D, self).__init__(in_channels=in_channels, out_channels=out_channels, final_sigmoid=final_sigmoid,
                                      en_kernel_type='2d', de_kernel_type='3d',
                                      basic_module=DoubleConv, f_maps=f_maps, layer_order=layer_order,
                                      num_levels=num_levels, is_segmentation=is_segmentation,
-                                     conv_padding=conv_padding, **kwargs)
+                                     conv_padding=conv_padding, features_out=features_out, **kwargs)
+
 
 class Generator3Dto2D(Abstract3DUNet):
     def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=16, layer_order='icr',
-                 num_levels=4, is_segmentation=False, conv_padding=1, **kwargs):
+                 num_levels=4, is_segmentation=False, conv_padding=1, features_out=False, **kwargs):
         super(Generator3Dto2D, self).__init__(in_channels=in_channels, out_channels=out_channels, final_sigmoid=final_sigmoid,
                                      en_kernel_type='3d', de_kernel_type='2d',
                                      basic_module=DoubleConv, f_maps=f_maps, layer_order=layer_order,
                                      num_levels=num_levels, is_segmentation=is_segmentation,
-                                     conv_padding=conv_padding, **kwargs)
+                                     conv_padding=conv_padding, features_out=features_out, **kwargs)
+
+
+class LocalEnhancer2Dto3D(nn.Module):
+    def __init__(self, input_nc, output_nc, f_maps, num_levels, n_local_enhancers=1, n_blocks_local=3):
+            super(LocalEnhancer2Dto3D, self).__init__() 
+            self.n_local_enhancers = n_local_enhancers
+            self.model = Generator2Dto3D(input_nc, output_nc, f_maps=f_maps*2, num_levels=num_levels-1, features_out=True)
+            self.downsample = nn.AvgPool2d(2, stride=2, count_include_pad=False)
+        
+            for n in range(1, n_local_enhancers+1):
+                ### downsample            
+                model_downsample = [nn.Conv2d(input_nc, f_maps//2, kernel_size=3, padding=1, bias=False), 
+                                    nn.InstanceNorm2d(f_maps//2),
+                                    nn.ReLU(True),
+                                    nn.Conv2d(f_maps//2, f_maps, kernel_size=3, padding=1, bias=False), 
+                                    nn.InstanceNorm2d(f_maps), 
+                                    nn.ReLU(True)]
+                ### residual blocks
+                model_upsample = []
+                # for i in range(n_blocks_local):
+                #     model_upsample += [ExtResNetBlock(f_maps*2, f_maps*2, kernel_type='3d')]
+
+                ### upsample
+                model_upsample += [ nn.InstanceNorm3d(f_maps*2+f_maps), 
+                                    nn.Conv3d(f_maps*2+f_maps, f_maps, kernel_size=3, padding=1, bias=False),
+                                    nn.ReLU(True),
+                                    nn.InstanceNorm3d(f_maps), 
+                                    nn.Conv3d(f_maps, f_maps, kernel_size=3, padding=1, bias=False),
+                                    nn.ReLU(True)
+                                    ]      
+
+                ### final convolution
+                if n == n_local_enhancers:                
+                    model_upsample += [ nn.Conv3d(f_maps, output_nc, kernel_size=1, padding=0), 
+                                        nn.Tanh()]                       
+                
+                upsample = [nn.ConvTranspose3d(f_maps*2, f_maps*2, kernel_size=3, stride=2, padding=1, output_padding=1)]
+                connect = Skipconnection(f_maps, f_maps, kernel_type='3d')
+                
+                setattr(self, 'model'+str(n)+'_01', nn.Sequential(*upsample))
+                setattr(self, 'model'+str(n)+'_02', connect)
+                setattr(self, 'model'+str(n)+'_1', nn.Sequential(*model_downsample))
+                setattr(self, 'model'+str(n)+'_2', nn.Sequential(*model_upsample))   
+
+    def forward(self, input): 
+        ### create input pyramid
+        input_downsampled = [input]
+        for i in range(self.n_local_enhancers):
+            input_downsampled.append(self.downsample(input_downsampled[-1]))
+
+        ### output at coarest level with shape [?, 32, 64, 64, 64]
+        output_prev = self.model(input_downsampled[-1])   
+        
+        ### build up one layer at a time
+        for n_local_enhancers in range(1, self.n_local_enhancers+1):
+            model_downsample = getattr(self, 'model'+str(n_local_enhancers)+'_1')
+            model_upsample = getattr(self, 'model'+str(n_local_enhancers)+'_2')  
+            upsample =  getattr(self, 'model'+str(n_local_enhancers)+'_01')
+            connect =  getattr(self, 'model'+str(n_local_enhancers)+'_02')            
+            input_i = input_downsampled[self.n_local_enhancers-n_local_enhancers] 
+            features = model_downsample(input_i)   
+            output_prev = model_upsample(torch.cat((upsample(output_prev), connect(features)), dim=1))
+        
+        return output_prev            
+
+
+class LocalEnhancer3Dto2D(nn.Module):
+    def __init__(self, input_nc, output_nc, f_maps, num_levels, n_local_enhancers=1, n_blocks_local=3):
+            super(LocalEnhancer3Dto2D, self).__init__() 
+            self.n_local_enhancers = n_local_enhancers
+            self.model = Generator3Dto2D(input_nc, output_nc, f_maps=f_maps*2, num_levels=num_levels-1, features_out=True)
+            self.downsample = nn.AvgPool3d(1, stride=2, count_include_pad=False)
+            
+            for n in range(1, n_local_enhancers+1):
+                ### downsample            
+                model_downsample = [nn.Conv3d(input_nc, f_maps//2, kernel_size=3, padding=1, bias=False), 
+                                    nn.InstanceNorm3d(f_maps//2),
+                                    nn.ReLU(True),
+                                    nn.Conv3d(f_maps//2, f_maps, kernel_size=3, padding=1, bias=False), 
+                                    nn.InstanceNorm3d(f_maps), 
+                                    nn.ReLU(True)]
+                ### residual blocks
+                model_upsample = []
+                # for i in range(n_blocks_local):
+                #     model_upsample += [ExtResNetBlock(f_maps*2, f_maps*2, kernel_type='2d')]
+
+                ### upsample
+                model_upsample += [ nn.InstanceNorm2d(f_maps*2+f_maps),
+                                    nn.Conv2d(f_maps*2+f_maps, f_maps, kernel_size=3, padding=1, bias=False),
+                                    nn.ReLU(True),
+                                    nn.InstanceNorm2d(f_maps), 
+                                    nn.Conv2d(f_maps, f_maps, kernel_size=3, padding=1, bias=False),
+                                    nn.ReLU(True)
+                                    ]      
+
+                ### final convolution
+                if n == n_local_enhancers:                
+                    model_upsample += [ nn.Conv2d(f_maps, output_nc, kernel_size=1, padding=0), 
+                                        nn.Tanh()]                       
+                
+                upsample = [nn.ConvTranspose2d(f_maps*2, f_maps*2, kernel_size=3, stride=2, padding=1, output_padding=1)]
+                connect = Skipconnection(f_maps, f_maps, kernel_type='2d')
+                setattr(self, 'model'+str(n)+'_01', nn.Sequential(*upsample))
+                setattr(self, 'model'+str(n)+'_02', connect)   
+                setattr(self, 'model'+str(n)+'_1', nn.Sequential(*model_downsample))
+                setattr(self, 'model'+str(n)+'_2', nn.Sequential(*model_upsample))   
+
+    def forward(self, input): 
+        ### create input pyramid
+        input_downsampled = [input]
+        for i in range(self.n_local_enhancers):
+            input_downsampled.append(self.downsample(input_downsampled[-1]))
+
+        ### output at coarest level
+        output_prev = self.model(input_downsampled[-1])        
+        
+        ### build up one layer at a time
+        for n_local_enhancers in range(1, self.n_local_enhancers+1):
+            model_downsample = getattr(self, 'model'+str(n_local_enhancers)+'_1')
+            model_upsample = getattr(self, 'model'+str(n_local_enhancers)+'_2')   
+            upsample =  getattr(self, 'model'+str(n_local_enhancers)+'_01')
+            connect =  getattr(self, 'model'+str(n_local_enhancers)+'_02')          
+            input_i = input_downsampled[self.n_local_enhancers-n_local_enhancers]   
+            features = model_downsample(input_i)   
+            output_prev = model_upsample(torch.cat((upsample(output_prev), connect(features)), dim=1))
+        
+        return output_prev 
+
 
 class Discriminator2D(nn.Module):
     def __init__(self, input_nc):
@@ -194,6 +328,7 @@ class Discriminator2D(nn.Module):
         x = F.avg_pool2d(x, x.size()[2:]).view(x.size()[0], -1)
         return x
 
+
 class Discriminator3D(nn.Module):
     def __init__(self, input_nc):
         super(Discriminator3D, self).__init__()
@@ -225,70 +360,3 @@ class Discriminator3D(nn.Module):
         x = F.avg_pool3d(x, x.size()[2:]).view(x.size()[0], -1)
         return x
 
-class WDiscriminator2D(nn.Module):
-    def __init__(self, input_nc):
-        super(WDiscriminator2D, self).__init__()
-        self.base_nc = 32
-        # A bunch of convolutions one after another
-        model = [   nn.Conv2d(input_nc, self.base_nc, 4, stride=2, padding=1),
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv2d(self.base_nc, self.base_nc*2, 4, stride=2, padding=1),
-                    nn.InstanceNorm2d(self.base_nc*2), 
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv2d(self.base_nc*2, self.base_nc*4, 4, stride=2, padding=1),
-                    nn.InstanceNorm2d(self.base_nc*4), 
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv2d(self.base_nc*4, self.base_nc*8, 4, stride=2, padding=1),
-                    nn.InstanceNorm2d(self.base_nc*8), 
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv2d(self.base_nc*8, self.base_nc*8, 4, stride=2, padding=1),
-                    nn.InstanceNorm2d(self.base_nc*8), 
-                    nn.LeakyReLU(0.2) ]
-
-        # FCN classification layer
-        model += [nn.Conv2d(self.base_nc*8, 1, 4)]
-
-        self.model = nn.Sequential(*model)
-
-    def forward(self, x):
-        x =  self.model(x)
-        x = x.view(-1)
-        return x
-
-class WDiscriminator3D(nn.Module):
-    def __init__(self, input_nc):
-        super(WDiscriminator3D, self).__init__()
-        self.base_nc = 32
-        # A bunch of convolutions one after another
-        model = [   nn.Conv3d(input_nc, self.base_nc, 4, stride=2, padding=1),
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv3d(self.base_nc, self.base_nc*2, 4, stride=2, padding=1),
-                    nn.InstanceNorm3d(self.base_nc*2), 
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv3d(self.base_nc*2, self.base_nc*4, 4, stride=2, padding=1),
-                    nn.InstanceNorm3d(self.base_nc*4), 
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv3d(self.base_nc*4, self.base_nc*8, 4, stride=2, padding=1),
-                    nn.InstanceNorm3d(self.base_nc*8), 
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv3d(self.base_nc*8, self.base_nc*8, 4, stride=2, padding=1),
-                    nn.InstanceNorm3d(self.base_nc*8), 
-                    nn.LeakyReLU(0.2) ]
-
-        # FCN classification layer
-        model += [nn.Conv3d(self.base_nc*8, 1, 4)]
-
-        self.model = nn.Sequential(*model)
-
-    def forward(self, x):
-        x =  self.model(x)
-        x = x.view(-1)
-        return x

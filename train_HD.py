@@ -2,7 +2,6 @@
 from pathlib import Path
 import argparse
 import itertools
-import logging
 
 import torchvision
 import torchvision.transforms as transforms
@@ -14,12 +13,11 @@ import torch
 from torch import nn
 import os
 
-from models.model import Generator2Dto3D, Generator3Dto2D
+from models.model import LocalEnhancer2Dto3D, LocalEnhancer3Dto2D
 from models.model import Discriminator2D, Discriminator3D
 from utils import ReplayBuffer
 from utils import LambdaLR
-from utils import Logger
-from utils import weights_init_normal
+from utils import weights_init_normal, load_network
 from loader import ImageDataset
 
 scaler = torch.cuda.amp.GradScaler()
@@ -31,20 +29,24 @@ parser.add_argument('--epoch', type=int, default=0, help='starting epoch')
 parser.add_argument('--n_epochs', type=int, default=100, help='number of epochs of training')
 parser.add_argument('--batchSize', type=int, default=6, help='size of the batches')
 parser.add_argument('--dataroot', type=str, default='../datasets/xray2ct/', help='root directory of the dataset')
-parser.add_argument('--lr', type=float, default=0.0002, help='initial learning rate')
+parser.add_argument('--lr', type=float, default=0.0001, help='initial learning rate')
 parser.add_argument('--decay_epoch', type=int, default=50, help='epoch to start linearly decaying the learning rate to 0')
 parser.add_argument('--size', type=int, default=128, help='size of the data crop (squared assumed)')
 parser.add_argument('--input_nc', type=int, default=3, help='number of channels of input data')
 parser.add_argument('--output_nc', type=int, default=1, help='number of channels of output data')
 parser.add_argument('--n_cpu', type=int, default=16, help='number of cpu threads to use during batch generation')
 parser.add_argument('--fp16', type=bool, default=False, help='use mixed precision or not')
+parser.add_argument('--generator_A2B', type=str, default='output/test_64_noide/netG_A2B.pth', help='A2B generator checkpoint file')
+parser.add_argument('--generator_B2A', type=str, default='output/test_64_noide/netG_B2A.pth', help='B2A generator checkpoint file')
+parser.add_argument('--n_local_enhancers', type=int, default=1, help='number of local enhancers used')
+parser.add_argument('--niter_fix_global', type=int, default=20, help='number of epochs that we only train the outmost local enhancer')
 opt = parser.parse_args()
 print(opt)
 
 ###### Definition of variables ######s
 # Networks
-netG_A2B = Generator2Dto3D(opt.input_nc, opt.output_nc, f_maps=16, num_levels=6)
-netG_B2A = Generator3Dto2D(opt.output_nc, opt.input_nc, f_maps=16, num_levels=6)
+netG_A2B = LocalEnhancer2Dto3D(opt.input_nc, opt.output_nc, f_maps=16, num_levels=6, n_local_enhancers=opt.n_local_enhancers)
+netG_B2A = LocalEnhancer3Dto2D(opt.output_nc, opt.input_nc, f_maps=16, num_levels=6, n_local_enhancers=opt.n_local_enhancers)
 netD_A = Discriminator2D(opt.input_nc)
 netD_B = Discriminator3D(opt.output_nc)
 
@@ -63,13 +65,37 @@ netG_B2A.apply(weights_init_normal)
 netD_A.apply(weights_init_normal)
 netD_B.apply(weights_init_normal)
 
-# Lossess
-criterion_identity = torch.nn.L1Loss()
+# load pretrained models
+netG_A2B = load_network(netG_A2B, opt.generator_A2B)
+netG_B2A = load_network(netG_B2A, opt.generator_B2A)
+
+# Losses
 criterion_GAN = torch.nn.MSELoss()
 criterion_cycle = torch.nn.L1Loss()
 
+# Freeze global generators 
+finetune_list = set()
+params_dict = dict(netG_A2B.named_parameters())
+params_GA2B = []
+for key, value in params_dict.items():       
+    if key.startswith('module.model' + str(opt.n_local_enhancers)):                    
+        params_GA2B += [value]
+        finetune_list.add(key)  
+print('------------- Only training the local enhancer network (for %d epochs) ------------' % opt.niter_fix_global)
+print('The layers that are finetuned in G A2B are ', sorted(finetune_list))   
+
+finetune_list = set()
+params_dict = dict(netG_B2A.named_parameters())
+params_GB2A = []
+for key, value in params_dict.items():       
+    if key.startswith('module.model' + str(opt.n_local_enhancers)):                    
+        params_GB2A += [value]
+        finetune_list.add(key)  
+print('------------- Only training the local enhancer network (for %d epochs) ------------' % opt.niter_fix_global)
+print('The layers that are finetuned in G B2A are ', sorted(finetune_list))   
+
 # Optimizers & LR schedulers
-optimizer_G = torch.optim.Adam(itertools.chain(netG_A2B.parameters(), netG_B2A.parameters()),
+optimizer_G = torch.optim.Adam(itertools.chain(params_GA2B, params_GB2A),
                                 lr=opt.lr, betas=(0.5, 0.999))
 optimizer_D_A = torch.optim.Adam(netD_A.parameters(), lr=opt.lr, betas=(0.5, 0.999))
 optimizer_D_B = torch.optim.Adam(netD_B.parameters(), lr=opt.lr, betas=(0.5, 0.999))
@@ -82,7 +108,6 @@ lr_scheduler_D_B = torch.optim.lr_scheduler.LambdaLR(optimizer_D_B, lr_lambda=La
 Tensor = torch.cuda.FloatTensor
 input_A = Tensor(opt.batchSize, opt.input_nc, opt.size, opt.size)
 input_B = Tensor(opt.batchSize, opt.output_nc, opt.size, opt.size, opt.size)
-# input_C = Tensor(opt.batchSize, opt.input_nc, opt.size, opt.size)
 target_real = Variable(Tensor(opt.batchSize).fill_(1.0), requires_grad=False)
 target_fake = Variable(Tensor(opt.batchSize).fill_(0.0), requires_grad=False)
 
@@ -99,13 +124,7 @@ dataloader = DataLoader(ImageDataset(opt.dataroot, transforms_=transforms_, unal
                         pin_memory=True, num_workers=opt.n_cpu)
 
 # Loss plot
-# logger = Logger(opt.n_epochs, len(dataloader))
 writer = SummaryWriter(comment=f'LR_{opt.lr}_BS_{opt.batchSize}')
-logging.info(f'''Starting training:
-    Epochs:          {opt.n_epochs}
-    Batch size:      {opt.batchSize}
-    Learning rate:   {opt.lr}
-''')
 ###################################
 train_iter = 0
 ###### Training ######
@@ -114,7 +133,6 @@ for epoch in range(opt.epoch, opt.n_epochs):
         # Set model input
         real_A = Variable(input_A.copy_(batch['A']))
         real_B = Variable(input_B.copy_(batch['B']))
-        # real_C = Variable(input_C.copy_(batch['C']))
 
         ###### Generators A2B and B2A ######
         optimizer_G.zero_grad()
@@ -133,17 +151,8 @@ for epoch in range(opt.epoch, opt.n_epochs):
         loss_cycle_ABA = criterion_cycle(recovered_A, real_A)*10.0
         
         recovered_B = netG_A2B(fake_A) # CT -> xray -> CT
-        loss_cycle_BAB = criterion_cycle(recovered_B, real_B)*20.0
+        loss_cycle_BAB = criterion_cycle(recovered_B, real_B)*30.0
 
-        # identity loss
-        # ddr = fake_B.sum(-1)
-        # ddr = ddr.view(ddr.size(0), ddr.size(1), -1)
-        # ddr -= ddr.min(-1, keepdim=True)[0]
-        # ddr /= ddr.max(-1, keepdim=True)[0]
-        # ddr = ddr * 2 - 1
-        # ddr = ddr.view(ddr.size(0), ddr.size(1), opt.size, opt.size)
-        # loss_identity_B = criterion_identity(ddr, real_C) * 10.0
-        
         # Total loss        
         if opt.fp16:
             with torch.cuda.amp.autocast():
@@ -155,7 +164,6 @@ for epoch in range(opt.epoch, opt.n_epochs):
             loss_G.backward()
             optimizer_G.step()
 
-        logging.info(f"G Loss: {loss_G} G GAN Loss: {loss_GAN_A2B + loss_GAN_B2A} G cycle Loss: {loss_cycle_ABA + loss_cycle_BAB}")
         writer.add_scalar('G_Loss/'+'train', loss_G, train_iter)
         writer.add_scalar('G_GANLoss/'+'train', loss_GAN_A2B + loss_GAN_B2A, train_iter)
         writer.add_scalar('G_cycleLoss/'+'train', loss_cycle_ABA + loss_cycle_BAB, train_iter)
@@ -209,22 +217,13 @@ for epoch in range(opt.epoch, opt.n_epochs):
             optimizer_D_B.step()
         ###################################
 
-        # Progress report (http://localhost:8097)
-        # logger.log({'loss_G': loss_G, 'loss_G_GAN': (loss_GAN_A2B + loss_GAN_B2A),
-        #             'loss_G_cycle': (loss_cycle_ABA + loss_cycle_BAB), 'loss_D': (loss_D_A + loss_D_B),
-        #             'loss_G_identity': loss_identity_B
-        #             }, 
-        #             images={'real_A': real_A, 'real_B':torch.squeeze(real_B)[0], 'fake_A': fake_A, 
-        #             'fake_B': torch.squeeze(fake_B)[0]
-        #             })
-        logging.info(f"D Loss: {loss_D_A + loss_D_B}")
         writer.add_scalar('D_Loss/'+'train', loss_D_A+loss_D_B, train_iter)
         writer.add_scalar('2D_DLoss/'+'train', loss_D_A, train_iter)
         writer.add_scalar('3D_DLoss/'+'train', loss_D_B, train_iter)
         train_iter += 1
-        real_grid = torchvision.utils.make_grid(real_A)
+        real_grid = torchvision.utils.make_grid((real_A+1)/2)
         writer.add_image('Real X-rays', real_grid)
-        fake_grid = torchvision.utils.make_grid(fake_A)
+        fake_grid = torchvision.utils.make_grid((fake_A+1)/2)
         writer.add_image('Generated X-rays', fake_grid)
 
 
@@ -234,6 +233,11 @@ for epoch in range(opt.epoch, opt.n_epochs):
     lr_scheduler_D_B.step()
     if opt.fp16:
         scaler.update()
+
+    if (opt.niter_fix_global != 0) and (epoch == opt.niter_fix_global):
+        optimizer_G = torch.optim.Adam(itertools.chain(netG_A2B.parameters(), netG_B2A.parameters()),
+                                lr=opt.lr, betas=(0.5, 0.999))
+        print('------------ Now also finetuning global generator -----------')
 
     # Save models checkpoints
     path = './output/test_/'

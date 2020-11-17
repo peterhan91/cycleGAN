@@ -3,6 +3,8 @@ import time
 import datetime
 import sys
 import math
+import os
+from collections import OrderedDict
 
 from torch import autograd
 from torch.autograd import Variable
@@ -10,10 +12,56 @@ import torch
 import torch.nn as nn
 from visdom import Visdom
 import numpy as np
+import SimpleITK as sitk
 
 def save_numpy(tensor, name):
     array = torch.squeeze(tensor).cpu().float().numpy()
     np.save(name, array)
+
+def save_dicom(tensor, name):
+    array = torch.squeeze(tensor).cpu().float().numpy()
+    array = np.clip(np.rint(array * 255.0), 0.0, 255.0).astype(np.uint8)
+    array = np.moveaxis(array, 1, 0)
+    array = array[::-1]
+    dicom_scan = sitk.GetImageFromArray(array)
+    sitk.WriteImage(dicom_scan, name)
+
+def load_network(network, save_path=None):          
+    if not os.path.isfile(save_path):
+        print('%s not exists yet!' % save_path)
+    else:
+        try:
+            network.load_state_dict(torch.load(save_path))
+        except:   
+            saved_dict = torch.load(save_path)    
+            pretrained_dict = OrderedDict()
+            for k, v in saved_dict.items():
+                ks = k.split('.')
+                ks[1] = 'model.'+ks[1]
+                name = '.'.join(ks)
+                pretrained_dict[name] = v
+
+            model_dict = network.state_dict()
+            
+            try:
+                pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}                    
+                network.load_state_dict(pretrained_dict)
+                print('Pretrained network G has excessive layers; Only loading layers that are used')
+            except:
+                print('Pretrained network G has fewer layers; The following are not initialized:')
+                for k, v in pretrained_dict.items():                    
+                    if v.size() == model_dict[k].size():
+                        model_dict[k] = v
+
+                not_initialized = set()                  
+                for k, v in model_dict.items():
+                    if k not in pretrained_dict or v.size() != pretrained_dict[k].size():
+                        # not_initialized.add(k.split('.')[0])
+                        not_initialized.add(k)
+                
+                print(sorted(not_initialized))
+                network.load_state_dict(model_dict)   
+    return network
 
 def tensor2image(tensor):
     image = 127.5*(tensor[0].cpu().float().numpy() + 1.0)
