@@ -86,6 +86,22 @@ class CTExtractor:
         image = image - self.PIXEL_MEAN
         return image
 
+    def pad_center(self, pix_resampled):
+        pad_z = max(self.roi - pix_resampled.shape[0], 0)
+        pad_x = max(self.roi - pix_resampled.shape[1], 0)
+        pad_y = max(self.roi - pix_resampled.shape[2], 0)
+        try: 
+            pad = np.pad(pix_resampled, 
+                    [(pad_z//2, pad_z-pad_z//2), (pad_x//2, pad_x-pad_x//2), (pad_y//2, pad_y-pad_y//2)], 
+                    mode='constant',
+                    constant_values=pix_resampled[0][10][10])
+        except ValueError:
+            print(pix_resampled.shape)
+        except IndexError:
+            print(pix_resampled.shape)
+            pass
+        return pad
+
     def crop_center(self, vol, cropz, cropy, cropx):
         z,y,x = vol.shape
         startx = x//2-(cropx//2)
@@ -103,25 +119,25 @@ class CTExtractor:
         self.patient = self.load_scan()
         self.vol = self.get_pixels_hu(self.patient)
         self.vol, _ = self.resample(self.vol, self.patient)
-        if self.vol.shape[0] > self.roi and self.vol.shape[1] > self.roi and self.vol.shape[2] > self.roi:
-            self.vol = self.crop_center(self.vol, self.roi, self.roi, self.roi)
-            assert self.vol.shape == (self.roi, self.roi, self.roi)
-            self.vol = scipy.ndimage.zoom(self.vol, 
-                    [self.size/self.roi, self.size/self.roi, self.size/self.roi], 
-                    mode='nearest')
-            assert self.vol.shape == (self.size, self.size, self.size)
-            self.vol = self.normalize(self.vol)
-            self.save()      
+        if self.vol.shape[0] >= self.roi and self.vol.shape[1] >= self.roi and self.vol.shape[2] >= self.roi:
+            self.vol = self.crop_center(self.vol, self.roi, self.roi, self.roi)  
         else:
-            print('Scan %s roi smaller than 256x256x256' % os.path.basename(self.path))
-
+            self.vol = self.pad_center(self.vol)
+            self.vol = self.crop_center(self.vol, self.roi, self.roi, self.roi)
+        assert self.vol.shape == (self.roi, self.roi, self.roi)
+        self.vol = scipy.ndimage.zoom(self.vol, 
+                [self.size/self.roi, self.size/self.roi, self.size/self.roi], 
+                mode='nearest')
+        assert self.vol.shape == (self.size, self.size, self.size)
+        self.vol = self.normalize(self.vol)
+        self.save()   
 
 
 def worker(fname, extractor):
-    # try:
-    extractor.run(fname)
-    # except:
-        # print('Error extracting the lung CT')
+    try:
+        extractor.run(fname)
+    except:
+        print('Error extracting the lung CT')
 
 
 if __name__ == "__main__":
@@ -129,7 +145,7 @@ if __name__ == "__main__":
     from multiprocessing import Pool, cpu_count
     from tqdm import tqdm
 
-    input_path = '/media/tianyu.han/mri-scratch/DeepLearning/rsna_lung/test/'
+    input_path = '/media/tianyu.han/mri-scratch/DeepLearning/rsna_lung/train/'
     # fnames += iglob('/media/tianyu.han/mri-scratch/DeepLearning/rsna_lung/test/*/*/')
 
     path_output = '../data/'
@@ -143,7 +159,7 @@ if __name__ == "__main__":
     print('total # of scans', len(fnames))
     
     
-    with Pool(cpu_count()) as pool:
+    with Pool(processes=4) as pool:
         res = list(tqdm(pool.imap(
             worker_partial, iter(fnames)), total=len(fnames)))
 
