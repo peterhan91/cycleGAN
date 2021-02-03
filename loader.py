@@ -38,12 +38,15 @@ class ImageDataset(Dataset):
 
 
 class TestDataset(Dataset):
-    def __init__(self, root, transforms_=None):
+    def __init__(self, root, transforms_=None, mode='train'):
         self.transform = transforms.Compose(transforms_)
-        self.files_A = sorted(glob.glob(os.path.join(root, 'LIDC_xrays') + '/*'+'/1-1.png'))
+        self.files_A = sorted(glob.glob(os.path.join(root, '%s/xrays/frontal' % mode) + '/*.png'))[:20]
+        self.files_C = sorted(glob.glob(os.path.join(root, '%s/xrays/lateral' % mode) + '/*.png'))[:20]
 
     def __getitem__(self, index):
-        item_A = self.transform(Image.open(self.files_A[index % len(self.files_A)]).convert('RGB'))
+        img_f = self.transform(Image.open(self.files_A[index % len(self.files_A)]))
+        img_l = self.transform(Image.open(self.files_C[index % len(self.files_C)]))
+        item_A = torch.stack((img_f.squeeze(0), img_l.squeeze(0)), dim=0)
 
         return {'A': item_A, 'path': self.files_A[index % len(self.files_A)]}
 
