@@ -3,7 +3,6 @@ from pathlib import Path
 import argparse
 import itertools
 
-from torch import nn
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
@@ -13,53 +12,68 @@ from PIL import Image
 import torch
 import os
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+
 from models.model import Generator2Dto3D, Generator3Dto2D
 from models.model import Discriminator2D, Discriminator3D
 from utils import ReplayBuffer
 from utils import LambdaLR
-from utils import weights_init_normal
 from loader import ImageDataset
 
 scaler = torch.cuda.amp.GradScaler()
-
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, [1, 2, 0]))
+
+def init_dist(backend='nccl', **kwargs):
+    ''' initialization for distributed training'''
+    rank = int(os.environ['RANK'])
+    num_gpus = torch.cuda.device_count()
+    torch.cuda.set_device(rank % num_gpus)
+    dist.init_process_group(backend=backend, **kwargs)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--epoch', type=int, default=0, help='starting epoch')
 parser.add_argument('--n_epochs', type=int, default=100, help='number of epochs of training')
-parser.add_argument('--batchSize', type=int, default=3, help='size of the batches')
+parser.add_argument('--batchSize', type=int, default=2, help='size of the batches')
 parser.add_argument('--dataroot', type=str, default='../../', help='root directory of the dataset')
-parser.add_argument('--lr', type=float, default=2e-4, help='initial learning rate')
-parser.add_argument('--decay_epoch', type=int, default=70, help='epoch to start linearly decaying the learning rate to 0')
+parser.add_argument('--lr', type=float, default=1e-4, help='initial learning rate')
+parser.add_argument('--decay_epoch', type=int, default=50, help='epoch to start linearly decaying the learning rate to 0')
 parser.add_argument('--size', type=int, default=128, help='size of the data crop (squared assumed)')
-parser.add_argument('--input_nc', type=int, default=1, help='number of channels of input data')
+parser.add_argument('--input_nc', type=int, default=3, help='number of channels of input data')
 parser.add_argument('--output_nc', type=int, default=1, help='number of channels of output data')
 parser.add_argument('--n_cpu', type=int, default=16, help='number of cpu threads to use during batch generation')
 parser.add_argument('--fp16', type=bool, default=False, help='use mixed precision or not')
+
+parser.add_argument('--local_rank', type=int, default=0)
+parser.add_argument('--dist', type=bool, default=False)
+parser.add_argument('--launcher', choices=['none', 'pytorch'], default='pytorch', help='job launcher')
 opt = parser.parse_args()
 print(opt)
 
-###### Definition of variables ######s
+#### distributed training settings ####
+if opt.launcher == 'none':  # disabled distributed training
+    opt.dist = False
+    rank = -1
+    print('Disabled distributed training.')
+else:
+    opt.dist = True
+    init_dist()
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+
+###### Definition of variables ######
+torch.backends.cudnn.benchmark = True
+device = torch.device('cuda')
 # Networks
-netG_A2B = Generator2Dto3D(opt.input_nc+2, opt.output_nc, f_maps=16, num_levels=4)
-netG_B2A = Generator3Dto2D(opt.output_nc, opt.input_nc+2, f_maps=16, num_levels=4)
-netD_A = Discriminator2D(opt.input_nc+2)
-netD_B = Discriminator3D(opt.output_nc)
+netG_A2B = Generator2Dto3D(opt.input_nc, opt.output_nc, f_maps=16, num_levels=4).to(device)
+netG_B2A = Generator3Dto2D(opt.output_nc, opt.input_nc, f_maps=16, num_levels=4).to(device)
+netD_A = Discriminator2D(opt.input_nc).to(device)
+netD_B = Discriminator3D(opt.output_nc).to(device)
 
-netG_A2B = nn.DataParallel(netG_A2B)
-netG_B2A = nn.DataParallel(netG_B2A)
-netD_A = nn.DataParallel(netD_A)
-netD_B = nn.DataParallel(netD_B)
-
-netG_A2B.cuda()
-netG_B2A.cuda()
-netD_A.cuda()
-netD_B.cuda()
-
-netG_A2B.apply(weights_init_normal)
-netG_B2A.apply(weights_init_normal)
-netD_A.apply(weights_init_normal)
-netD_B.apply(weights_init_normal)
+netG_A2B = DistributedDataParallel(netG_A2B, device_ids=[torch.cuda.current_device()])
+netG_B2A = DistributedDataParallel(netG_B2A, device_ids=[torch.cuda.current_device()])
+netD_A = DistributedDataParallel(netD_A, device_ids=[torch.cuda.current_device()])
+netD_B = DistributedDataParallel(netD_B, device_ids=[torch.cuda.current_device()])
 
 # Lossess
 criterion_GAN = torch.nn.MSELoss()
@@ -84,9 +98,6 @@ lr_scheduler_D_B = torch.optim.lr_scheduler.LambdaLR(optimizer_D_B,
 
 # Inputs & targets memory allocation
 Tensor = torch.cuda.FloatTensor
-# input_A = Tensor(opt.batchSize, opt.input_nc+2, opt.size, opt.size)
-# input_B = Tensor(opt.batchSize, opt.input_nc, opt.size, opt.size, opt.size)
-
 fake_A_buffer = ReplayBuffer()
 fake_B_buffer = ReplayBuffer()
 
@@ -99,27 +110,29 @@ transforms_ = [ transforms.Resize(128, Image.BICUBIC),
                 # transforms.RandomCrop(opt.size), 
                 transforms.ToTensor(),
                 transforms.Normalize((0.5), (0.5)) ]
-dataloader = DataLoader(ImageDataset(opt.dataroot, transforms_=transforms_, unaligned=True), 
-                        batch_size=opt.batchSize, shuffle=True, drop_last=True, 
-                        pin_memory=True, num_workers=opt.n_cpu, collate_fn=collate_fn)
+
+my_trainset = ImageDataset(opt.dataroot, transforms_=transforms_, unaligned=True)
+train_sampler = torch.utils.data.distributed.DistributedSampler(my_trainset)
+dataloader = DataLoader(my_trainset, batch_size=opt.batchSize, pin_memory=True, 
+                        num_workers=opt.n_cpu, collate_fn=collate_fn, sampler=train_sampler)
 
 ###################################
 train_iter = 0
 lambda_gan = 1
 lambda_cycle = 10
 lambda_ident = 0.5
-
-writer = SummaryWriter(comment=f'LR_{opt.lr}_BS_{opt.batchSize}_lambg_{lambda_gan}_lambc_{lambda_cycle}')
+if rank <= 0:
+    writer = SummaryWriter(comment=f'LR_{opt.lr}_BS_{opt.batchSize}_lambg_{lambda_gan}_lambc_{lambda_cycle}')
 ###### Training ######
 for epoch in range(opt.epoch, opt.n_epochs):
     for i, batch in enumerate(dataloader):
         # Set model input
         # real_A = Variable(input_A.copy_(batch['A']))
         # real_B = Variable(input_B.copy_(batch['B']))
-        real_A = Variable(batch['A']).cuda()
-        real_B = Variable(batch['B']).cuda()
-        target_real = Variable(Tensor(real_A.shape[0], 1).fill_(1.0), requires_grad=False)
-        target_fake = Variable(Tensor(real_B.shape[0], 1).fill_(0.0), requires_grad=False)
+        real_A = batch['A'].to(device)
+        real_B = batch['B'].to(device)
+        target_real = Variable(Tensor(real_A.shape[0], 1).fill_(1.0), requires_grad=False).to(device)
+        target_fake = Variable(Tensor(real_B.shape[0], 1).fill_(0.0), requires_grad=False).to(device)
 
         ###### Generators A2B and B2A ######
         optimizer_G.zero_grad()
@@ -163,12 +176,12 @@ for epoch in range(opt.epoch, opt.n_epochs):
             loss_G = loss_GAN_A2B + loss_GAN_B2A + loss_cycle_ABA + loss_cycle_BAB + loss_ident_B2B
             loss_G.backward()
             optimizer_G.step()
-
-        print(f"G Loss: {loss_G} G GAN Loss: {loss_GAN_A2B + loss_GAN_B2A} G cycle Loss: {loss_cycle_ABA + loss_cycle_BAB}")
-        writer.add_scalar('G_Loss/'+'train', loss_G, train_iter)
-        writer.add_scalar('G_GANLoss/'+'train', loss_GAN_A2B + loss_GAN_B2A, train_iter)
-        writer.add_scalar('G_cycleLoss/'+'train', loss_cycle_ABA + loss_cycle_BAB, train_iter)
-        writer.add_scalar('G_identityLoss/'+'train', loss_ident_B2B, train_iter)
+        if dist.get_rank() == 0:
+            print(f"G Loss: {loss_G} G GAN Loss: {loss_GAN_A2B + loss_GAN_B2A} G cycle Loss: {loss_cycle_ABA + loss_cycle_BAB}")
+            writer.add_scalar('G_Loss/'+'train', loss_G, train_iter)
+            writer.add_scalar('G_GANLoss/'+'train', loss_GAN_A2B + loss_GAN_B2A, train_iter)
+            writer.add_scalar('G_cycleLoss/'+'train', loss_cycle_ABA + loss_cycle_BAB, train_iter)
+            writer.add_scalar('G_identityLoss/'+'train', loss_ident_B2B, train_iter)
         ###################################
 
         ###### Discriminator A ######
@@ -225,16 +238,25 @@ for epoch in range(opt.epoch, opt.n_epochs):
             loss_D_B.backward()
             optimizer_D_B.step()
         ###################################
+        if dist.get_rank() == 0:
+            print(f"D Loss: {loss_D_A + loss_D_B}")
+            writer.add_scalar('D_Loss/'+'train', loss_D_A+loss_D_B, train_iter)
+            writer.add_scalar('2D_DLoss/'+'train', loss_D_A, train_iter)
+            writer.add_scalar('3D_DLoss/'+'train', loss_D_B, train_iter)
+            train_iter += 1
+            real_grid = torchvision.utils.make_grid(real_A)
+            writer.add_image('Real X-rays', 0.5*(real_grid+1))
+            fake_grid = torchvision.utils.make_grid(fake_A)
+            writer.add_image('Generated X-rays', 0.5*(fake_grid+1))
 
-        print(f"D Loss: {loss_D_A + loss_D_B}")
-        writer.add_scalar('D_Loss/'+'train', loss_D_A+loss_D_B, train_iter)
-        writer.add_scalar('2D_DLoss/'+'train', loss_D_A, train_iter)
-        writer.add_scalar('3D_DLoss/'+'train', loss_D_B, train_iter)
-        train_iter += 1
-        real_grid = torchvision.utils.make_grid(real_A)
-        writer.add_image('Real X-rays', 0.5*(real_grid+1))
-        fake_grid = torchvision.utils.make_grid(fake_A)
-        writer.add_image('Generated X-rays', 0.5*(fake_grid+1))
+            # Save models checkpoints
+            if train_iter % 1000 == 0:
+                path = './output/test_/'
+                Path(path).mkdir(parents=True, exist_ok=True)
+                torch.save(netG_A2B.state_dict(), path + 'netG_A2B_%d.pth' %(train_iter))
+                torch.save(netG_B2A.state_dict(), path + 'netG_B2A_%d.pth' %(train_iter))
+                torch.save(netD_A.state_dict(), path + 'netD_A_%d.pth' %(train_iter))
+                torch.save(netD_B.state_dict(), path + 'netD_B_%d.pth' %(train_iter))
 
 
     # Update learning rates
@@ -244,13 +266,6 @@ for epoch in range(opt.epoch, opt.n_epochs):
     if opt.fp16:
         scaler.update()
 
-    # Save models checkpoints
-    path = './output/test_10_1/'
-    Path(path).mkdir(parents=True, exist_ok=True)
-    torch.save(netG_A2B.state_dict(), path + 'netG_A2B.pth')
-    torch.save(netG_B2A.state_dict(), path + 'netG_B2A.pth')
-    torch.save(netD_A.state_dict(), path + 'netD_A.pth')
-    torch.save(netD_B.state_dict(), path + 'netD_B.pth')
 
 writer.close()
 ###################################
