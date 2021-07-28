@@ -203,7 +203,7 @@ class Encoder(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, conv_kernel_size=3, conv_kernel_type='2d', apply_pooling=True,
-                 pool_kernel_size=2, pool_type='max', basic_module=DoubleConv, conv_layer_order='icr',
+                 pool_kernel_size=2, pool_type='max', basic_module=DoubleConv, conv_layer_order='cir',
                  padding=1):
         super(Encoder, self).__init__()
         assert pool_type in ['max', 'avg']
@@ -256,7 +256,7 @@ class Decoder(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, conv_kernel_size=3, conv_kernel_type='2d', scale_factor=2, 
-                 basic_module=DoubleConv, conv_layer_order='icr', mode='nearest', padding=1):
+                 basic_module=DoubleConv, conv_layer_order='cir', mode='nearest', padding=1):
         super(Decoder, self).__init__()
         if basic_module == DoubleConv:
             # if DoubleConv is the basic_module use interpolation for upsampling and concatenation joining

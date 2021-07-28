@@ -1,46 +1,14 @@
-import importlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.buildingblocks import Encoder, Decoder, SingleConv, DoubleConv, ExtResNetBlock, Skipconnection
+from models.buildingblocks import Encoder, Decoder, SingleConv, DoubleConv, Skipconnection, ExtResNetBlock
 
 def number_of_features_per_level(init_channel_number, num_levels):
     return [init_channel_number * 2 ** k for k in range(num_levels)]
 
 class Abstract3DUNet(nn.Module):
-    """
-    Base class for standard and residual UNet.
-    Args:
-        in_channels (int): number of input channels
-        out_channels (int): number of output segmentation masks;
-            Note that that the of out_channels might correspond to either
-            different semantic classes or to different binary segmentation mask.
-            It's up to the user of the class to interpret the out_channels and
-            use the proper loss criterion during training (i.e. CrossEntropyLoss (multi-class)
-            or BCEWithLogitsLoss (two-class) respectively)
-        f_maps (int, tuple): number of feature maps at each level of the encoder; if it's an integer the number
-            of feature maps is given by the geometric progression: f_maps ^ k, k=1,2,3,4
-        final_sigmoid (bool): if True apply element-wise nn.Sigmoid after the
-            final 1x1 convolution, otherwise apply nn.Softmax. MUST be True if nn.BCELoss (two-class) is used
-            to train the model. MUST be False if nn.CrossEntropyLoss (multi-class) is used to train the model.
-        basic_module: basic model for the encoder/decoder (DoubleConv, ExtResNetBlock, ....)
-        layer_order (string): determines the order of layers
-            in `SingleConv` module. e.g. 'crg' stands for Conv3d+ReLU+GroupNorm3d.
-            See `SingleConv` for more info
-        f_maps (int, tuple): if int: number of feature maps in the first conv layer of the encoder (default: 64);
-            if tuple: number of feature maps at each level
-        num_levels (int): number of levels in the encoder/decoder path (applied only if f_maps is an int)
-        is_segmentation (bool): if True (semantic segmentation problem) Sigmoid/Softmax normalization is applied
-            after the final convolution; if False (regression problem) the normalization layer is skipped at the end
-        testing (bool): if True (testing mode) the `final_activation` (if present, i.e. `is_segmentation=true`)
-            will be applied as the last operation during the forward pass; if False the model is in training mode
-            and the `final_activation` (even if present) won't be applied; default: False
-        conv_kernel_size (int or tuple): size of the convolving kernel in the basic_module
-        pool_kernel_size (int or tuple): the size of the window
-        conv_padding (int or tuple): add zero-padding added to all three sides of the input
-    """
 
-    def __init__(self, in_channels, out_channels, final_sigmoid, basic_module, f_maps=64, layer_order='icr',
+    def __init__(self, in_channels, out_channels, final_sigmoid, basic_module, f_maps=64, layer_order='cir',
                  num_levels=4, is_segmentation=True, testing=False, en_kernel_type='2d', de_kernel_type='3d',
                  conv_kernel_size=3, pool_kernel_size=2, conv_padding=1, features_out=None, **kwargs):
         super(Abstract3DUNet, self).__init__()
@@ -151,7 +119,7 @@ class Abstract3DUNet(nn.Module):
 
 
 class Generator2Dto3D(Abstract3DUNet):
-    def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=16, layer_order='icr',
+    def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=16, layer_order='cir',
                  num_levels=4, is_segmentation=False, conv_padding=1, features_out=False, **kwargs):
         super(Generator2Dto3D, self).__init__(in_channels=in_channels, out_channels=out_channels, final_sigmoid=final_sigmoid,
                                      en_kernel_type='2d', de_kernel_type='3d',
@@ -161,7 +129,7 @@ class Generator2Dto3D(Abstract3DUNet):
 
 
 class Generator3Dto2D(Abstract3DUNet):
-    def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=16, layer_order='icr',
+    def __init__(self, in_channels, out_channels, final_sigmoid=False, f_maps=16, layer_order='cir',
                  num_levels=4, is_segmentation=False, conv_padding=1, features_out=False, **kwargs):
         super(Generator3Dto2D, self).__init__(in_channels=in_channels, out_channels=out_channels, final_sigmoid=final_sigmoid,
                                      en_kernel_type='3d', de_kernel_type='2d',
