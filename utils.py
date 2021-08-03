@@ -190,28 +190,27 @@ def weights_init_normal(net):
 			m.weight.data.normal_(0, 0.01)
 			m.bias.data.zero_()
 
-def calc_gradient_penalty(netD, real_data, fake_data, data_dim, batch_size, dim, gp_lambda):
-    alpha = torch.rand(batch_size, 1)
-    alpha = alpha.expand(batch_size, int(real_data.nelement()/batch_size)).contiguous()
-    if data_dim == '2d':
-        alpha = alpha.view(batch_size, 3, dim, dim)
-        fake_data = fake_data.view(batch_size, 3, dim, dim)
-    elif data_dim == '3d':
-        alpha = alpha.view(batch_size, 1, dim, dim, dim)
-        fake_data = fake_data.view(batch_size, 1, dim, dim, dim)
-    alpha = alpha.cuda()
-    
-    interpolates = alpha * real_data.detach() + ((1 - alpha) * fake_data.detach())
+def gradient_penalty(critic, real, fake, type='2d', device="cpu"):
+    if type == '2d':
+        BATCH_SIZE, C, H, W = real.shape
+        alpha = torch.rand((BATCH_SIZE, 1, 1, 1)).repeat(1, C, H, W).to(device)
+    elif type == '3d':
+        BATCH_SIZE, C, D, H, W = real.shape
+        alpha = torch.rand((BATCH_SIZE, 1, 1, 1, 1)).repeat(1, C, D, H, W).to(device)
+    interpolated_images = real * alpha + fake * (1 - alpha)
 
-    interpolates = interpolates.cuda()
-    interpolates.requires_grad_(True)
+    # Calculate critic scores
+    mixed_scores = critic(interpolated_images)
 
-    disc_interpolates = netD(interpolates)
-
-    gradients = autograd.grad(outputs=disc_interpolates, inputs=interpolates,
-                              grad_outputs=torch.ones(disc_interpolates.size()).cuda(),
-                              create_graph=True, retain_graph=True, only_inputs=True)[0]
-
-    gradients = gradients.view(gradients.size(0), -1)                              
-    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * gp_lambda
+    # Take the gradient of the scores with respect to the images
+    gradient = torch.autograd.grad(
+        inputs=interpolated_images,
+        outputs=mixed_scores,
+        grad_outputs=torch.ones_like(mixed_scores),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    gradient = gradient.view(gradient.shape[0], -1)
+    gradient_norm = gradient.norm(2, dim=1)
+    gradient_penalty = torch.mean((gradient_norm - 1) ** 2)
     return gradient_penalty

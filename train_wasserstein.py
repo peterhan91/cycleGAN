@@ -7,7 +7,6 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
-from torch.autograd import Variable
 from PIL import Image
 import torch
 import os
@@ -15,6 +14,7 @@ import os
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
+import utils
 from models.model import Generator2Dto3D, Generator3Dto2D
 from models.model import Discriminator2D, Discriminator3D
 from utils import ReplayBuffer
@@ -34,15 +34,16 @@ def init_dist(backend='nccl', **kwargs):
 parser = argparse.ArgumentParser()
 parser.add_argument('--epoch', type=int, default=0, help='starting epoch')
 parser.add_argument('--n_epochs', type=int, default=100, help='number of epochs of training')
-parser.add_argument('--batchSize', type=int, default=3, help='size of the batches')
+parser.add_argument('--batchSize', type=int, default=2, help='size of the batches')
 parser.add_argument('--dataroot', type=str, default='../../', help='root directory of the dataset')
 parser.add_argument('--lr', type=float, default=1e-4, help='initial learning rate')
 parser.add_argument('--decay_epoch', type=int, default=50, help='epoch to start linearly decaying the learning rate to 0')
 parser.add_argument('--size', type=int, default=128, help='size of the data crop (squared assumed)')
 parser.add_argument('--input_nc', type=int, default=3, help='number of channels of input data')
 parser.add_argument('--output_nc', type=int, default=1, help='number of channels of output data')
-parser.add_argument('--n_cpu', type=int, default=32, help='number of cpu threads to use during batch generation')
+parser.add_argument('--n_cpu', type=int, default=16, help='number of cpu threads to use during batch generation')
 parser.add_argument('--fp16', type=bool, default=False, help='use mixed precision or not')
+parser.add_argument('--crit_iter', type=int, default=5, help='# discriminator iterations')
 parser.add_argument('--last_iter', type=int, default=0, help='last training iteration')
 parser.add_argument('--checkpoint_path', type=str, default=None, help='checkpoint dir')
 
@@ -72,7 +73,7 @@ device = torch.device('cuda')
 netG_A2B = Generator2Dto3D(opt.input_nc, opt.output_nc, f_maps=16, num_levels=6).to(device)
 netG_B2A = Generator3Dto2D(opt.output_nc, opt.input_nc, f_maps=16, num_levels=6).to(device)
 netD_A = Discriminator2D(opt.input_nc).to(device)
-netD_B = Discriminator3D(opt.output_nc).to(device)
+netD_B = Discriminator2D(opt.size).to(device)
 
 
 # Set networks to DistributedDataParallel
@@ -108,9 +109,9 @@ criterion_idt = torch.nn.L1Loss()
 # Optimizers & LR schedulers
 optimizer_G = torch.optim.Adam(itertools.chain(netG_A2B.parameters(), 
                                             netG_B2A.parameters()),
-                                lr=opt.lr, betas=(0.5, 0.999))
-optimizer_D_A = torch.optim.Adam(netD_A.parameters(), lr=opt.lr, betas=(0.5, 0.999))
-optimizer_D_B = torch.optim.Adam(netD_B.parameters(), lr=opt.lr, betas=(0.5, 0.999))
+                                lr=opt.lr, betas=(0.9, 0.999))
+optimizer_D_A = torch.optim.Adam(netD_A.parameters(), lr=opt.lr, betas=(0.9, 0.999))
+optimizer_D_B = torch.optim.Adam(netD_B.parameters(), lr=opt.lr, betas=(0.9, 0.999))
 
 lr_scheduler_G = torch.optim.lr_scheduler.LambdaLR(optimizer_G, 
                     lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step)
@@ -144,111 +145,72 @@ dataloader = DataLoader(my_trainset, batch_size=opt.batchSize, pin_memory=True, 
 
 ###################################
 train_iter = opt.last_iter
-lambda_gan2D = 0.5
-lambda_gan3D = 0.5
+lambda_gan = 0.1
 lambda_cycle2D = 10
 lambda_cycle3D = 20
 lambda_ident = 0.5
 if rank <= 0 and opt.logging:
-    writer = SummaryWriter(comment=f'LR_{opt.lr}_BS_{opt.batchSize}_lambg_{lambda_gan3D}_lambc_{lambda_cycle3D}')
+    writer = SummaryWriter(comment=f'LR_{opt.lr}_BS_{opt.batchSize}_lambc_{lambda_cycle3D}')
 ###### Training ######
 for epoch in range(opt.epoch, opt.n_epochs):
     for i, batch in enumerate(dataloader):
         # Set model input
-        # real_A = Variable(input_A.copy_(batch['A']))
-        # real_B = Variable(input_B.copy_(batch['B']))
         real_A = batch['A'].to(device)
         real_B = batch['B'].to(device)
-        target_real = Variable(Tensor(real_A.shape[0], 1).fill_(1.0), requires_grad=False).to(device)
-        target_fake = Variable(Tensor(real_B.shape[0], 1).fill_(0.0), requires_grad=False).to(device)
 
-        ###### Generators A2B and B2A ######
-        optimizer_G.zero_grad()
+        ############ Discriminator update ############
+        for _ in range(opt.crit_iter):
+            ###### Discriminator B ######
+            fake_B = netG_A2B(real_A) # xray -> CT
+            critic_realB = netD_B(real_B.squeeze()).reshape(-1)
+            critic_fakeB = netD_B(fake_B.squeeze()).reshape(-1)
+            gp_B = utils.gradient_penalty(netD_B, real_B.squeeze(), fake_B.squeeze(), device=device)
+            
+            loss_D_B = (-(torch.mean(critic_realB) - torch.mean(critic_fakeB)) + 10.0 * gp_B) * lambda_gan
+            netD_B.zero_grad()
+            loss_D_B.backward(retain_graph=True)
+            optimizer_D_B.step()
 
+            ###### Discriminator A ######
+            fake_A = netG_B2A(real_B) # CT -> xray
+            critic_realA = netD_A(real_A).reshape(-1)
+            critic_fakeA = netD_A(fake_A).reshape(-1)
+            gp_A = utils.gradient_penalty(netD_A, real_A, fake_A, device=device)
+            
+            loss_D_A = (-(torch.mean(critic_realA) - torch.mean(critic_fakeA)) + 10.0 * gp_A) * lambda_gan
+            netD_A.zero_grad()
+            loss_D_A.backward(retain_graph=True)
+            optimizer_D_A.step()
+
+        ############ Generator update ############
         # GAN loss
-        fake_B = netG_A2B(real_A) # xray -> CT
-        pred_fake = netD_B(fake_B)
-        loss_GAN_A2B = criterion_GAN(pred_fake, target_real) * lambda_gan2D
-        fake_A = netG_B2A(real_B) # CT -> xray
-        pred_fake = netD_A(fake_A)
-        loss_GAN_B2A = criterion_GAN(pred_fake, target_real) * lambda_gan3D
+        fake_B = fake_B_buffer.push_and_pop(fake_B)
+        gen_fakeB = netD_B(fake_B.detach().squeeze()) # xray -> CT -> D(CT)
+        loss_GAN_A2B = -torch.mean(gen_fakeB) * lambda_gan
+        fake_A = fake_A_buffer.push_and_pop(fake_A)
+        gen_fakeA = netD_A(fake_A.detach()) # CT -> xray -> D(Xray)
+        loss_GAN_B2A = -torch.mean(gen_fakeA) * lambda_gan
 
         # Cycle loss
-        recovered_A = netG_B2A(fake_B) # xray -> CT -> xray
+        recovered_A = netG_B2A(fake_B.detach()) # xray -> CT -> xray
         loss_cycle_ABA = criterion_cycle(recovered_A, real_A)*lambda_cycle2D
-        recovered_B = netG_A2B(fake_A) # CT -> xray -> CT
+        recovered_B = netG_A2B(fake_A.detach()) # CT -> xray -> CT
         loss_cycle_BAB = criterion_cycle(recovered_B, real_B)*lambda_cycle3D
-
-        # loss_later = criterion_cycle_(recovered_B.mean(-1), real_B.mean(-1))
-        # loss_axial = criterion_cycle_(recovered_B.mean(-2), real_B.mean(-2))
-        # loss_front = criterion_cycle_(recovered_B.mean(-3), real_B.mean(-3))
-        # loss_cycle_proj = (loss_axial + loss_front + loss_later) / 3 
-        # loss_cycle_BAB += loss_cycle_proj * lambda_cycle2D
     
         # identity loss
-        # proj_B = real_B.repeat(1, 3, 1, 1, 1).mean(-3)
-        # proj_B -= proj_B.min(-1, keepdim=True)[0]
-        # proj_B /= proj_B.max(-1, keepdim=True)[0]
-        # ident_B = netG_A2B((proj_B-0.5)/0.5)
-        # loss_ident_B2B = criterion_idt(ident_B, real_B) * lambda_ident
+        proj_B = real_B.repeat(1, 3, 1, 1, 1).mean(-3)
+        proj_B -= proj_B.min(-1, keepdim=True)[0]
+        proj_B /= proj_B.max(-1, keepdim=True)[0]
+        ident_B = netG_A2B((proj_B-0.5)/0.5)
+        loss_ident_B2B = criterion_idt(ident_B, real_B) * lambda_ident
         
         # Total loss        
-        if opt.fp16:
-            with torch.cuda.amp.autocast():
-                loss_G = loss_GAN_A2B + loss_GAN_B2A + loss_cycle_ABA + loss_cycle_BAB 
-            scaler.scale(loss_G).backward()
-            scaler.step(optimizer_G)
-        else:
-            loss_G = loss_GAN_A2B + loss_GAN_B2A + loss_cycle_ABA + loss_cycle_BAB
-            loss_G.backward()
-            optimizer_G.step()
-        ###################################
-
-        ###### Discriminator A ######
-        optimizer_D_A.zero_grad()
-        # Real loss
-        pred_real = netD_A(real_A) # D(xray)
-        loss_D_real = criterion_GAN(pred_real, target_real)
-
-        # Fake loss
-        fake_A = fake_A_buffer.push_and_pop(fake_A)
-        pred_fake = netD_A(fake_A.detach())
-        loss_D_fake = criterion_GAN(pred_fake, target_fake)
-
-        # Total loss
-        if opt.fp16:
-            with torch.cuda.amp.autocast():
-                loss_D_A = (loss_D_real + loss_D_fake)*0.05
-            scaler.scale(loss_D_A).backward()
-            scaler.step(optimizer_D_A)
-        else:
-            loss_D_A = (loss_D_real + loss_D_fake) * lambda_gan2D
-            loss_D_A.backward()
-            optimizer_D_A.step()
-        ###################################
-
-        ###### Discriminator B ######
-        optimizer_D_B.zero_grad()
-        # Real loss
-        pred_real = netD_B(real_B) #D(CT)
-        loss_D_real = criterion_GAN(pred_real, target_real)
+        loss_G = loss_GAN_A2B + loss_GAN_B2A + loss_cycle_ABA + loss_cycle_BAB + loss_ident_B2B
+        netG_A2B.zero_grad()
+        netG_B2A.zero_grad()
+        loss_G.backward()
+        optimizer_G.step()
         
-        # Fake loss
-        fake_B = fake_B_buffer.push_and_pop(fake_B)
-        pred_fake = netD_B(fake_B.detach())
-        loss_D_fake = criterion_GAN(pred_fake, target_fake)
-
-        # Total loss
-        if opt.fp16:
-            with torch.cuda.amp.autocast():
-                loss_D_B = (loss_D_real + loss_D_fake)*0.95
-            scaler.scale(loss_D_B).backward()
-            scaler.step(optimizer_D_B)
-        else:
-            loss_D_B = (loss_D_real + loss_D_fake) * lambda_gan3D
-            loss_D_B.backward()
-            optimizer_D_B.step()
-        ###################################
         if dist.get_rank() == 0:
             print(f"G Loss: {loss_G} G GAN Loss: {loss_GAN_A2B + loss_GAN_B2A} G cycle Loss: {loss_cycle_ABA + loss_cycle_BAB}")
             print(f"D Loss: {loss_D_A + loss_D_B}")
@@ -256,11 +218,11 @@ for epoch in range(opt.epoch, opt.n_epochs):
                 writer.add_scalar('G_Loss/'+'train', loss_G, train_iter)
                 writer.add_scalar('G_GANLoss/'+'train', loss_GAN_A2B + loss_GAN_B2A, train_iter)
                 writer.add_scalar('G_cycleLoss/'+'train', loss_cycle_ABA + loss_cycle_BAB, train_iter)
-                # writer.add_scalar('G_identityLoss/'+'train', loss_ident_B2B, train_iter)
+                writer.add_scalar('G_identityLoss/'+'train', loss_ident_B2B, train_iter)
                 writer.add_scalar('D_Loss/'+'train', loss_D_A+loss_D_B, train_iter)
                 writer.add_scalar('2D_DLoss/'+'train', loss_D_A, train_iter)
                 writer.add_scalar('3D_DLoss/'+'train', loss_D_B, train_iter)
-                if train_iter % 50 == 0:
+                if train_iter % 200 == 0:
                     with torch.no_grad():
                         real_grid = torchvision.utils.make_grid((real_B[:,:,64]+1)/2)
                         writer.add_image('Real CTs', real_grid, global_step=train_iter)
@@ -277,14 +239,9 @@ for epoch in range(opt.epoch, opt.n_epochs):
                 torch.save(netD_B.state_dict(), path + 'netD_B_%d.pth' %(train_iter))
             train_iter += 1
 
-
     # Update learning rates
     lr_scheduler_G.step()
     lr_scheduler_D_A.step()
     lr_scheduler_D_B.step()
-    if opt.fp16:
-        scaler.update()
-
-
 writer.close()
 ###################################

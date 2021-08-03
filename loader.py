@@ -50,6 +50,7 @@ class ImageDataset(Dataset):
                 dim_min = min(item_B.shape)
             r = 128 / dim_min
             crop = self.crop_center(item_B, dim_min, dim_min, dim_min)
+            crop[crop==-2000] = 0 
             crop = scipy.ndimage.interpolation.zoom(crop, r, mode='nearest')
             
             crop = self.normal_3D(crop)

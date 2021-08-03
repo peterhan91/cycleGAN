@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.buildingblocks import Encoder, Decoder, SingleConv, DoubleConv, Skipconnection, ExtResNetBlock
+from models.buildingblocks import Encoder, Decoder, SingleConv, DoubleConv, Skipconnection
 
 def number_of_features_per_level(init_channel_number, num_levels):
     return [init_channel_number * 2 ** k for k in range(num_levels)]
+
 
 class Abstract3DUNet(nn.Module):
 
@@ -270,30 +271,49 @@ class Discriminator2D(nn.Module):
         super(Discriminator2D, self).__init__()
         self.base_nc = 32
         # A bunch of convolutions one after another
-        model = [   nn.Conv2d(input_nc, self.base_nc, 4, stride=2, padding=1),
-                    nn.LeakyReLU(0.2) ]
-
+        # input: N x channels_img x 128 x 128
+        model = []
+        model += [  nn.Conv2d(input_nc, self.base_nc, 4, stride=2, padding=1),
+                    nn.LeakyReLU(0.2),
+                    nn.Dropout2d(0.25) ] # 64x64
         model += [  nn.Conv2d(self.base_nc, self.base_nc*2, 4, stride=2, padding=1),
                     nn.InstanceNorm2d(self.base_nc*2), 
-                    nn.LeakyReLU(0.2) ]
-
+                    nn.LeakyReLU(0.2),
+                    nn.Dropout2d(0.25) ] # 32x32
         model += [  nn.Conv2d(self.base_nc*2, self.base_nc*4, 4, stride=2, padding=1),
                     nn.InstanceNorm2d(self.base_nc*4), 
-                    nn.LeakyReLU(0.2) ]
-
-        model += [  nn.Conv2d(self.base_nc*4, self.base_nc*8, 4, padding=1),
-                    nn.InstanceNorm2d(self.base_nc*8), 
-                    nn.LeakyReLU(0.2) ]
-
+                    nn.LeakyReLU(0.2),
+                    nn.Dropout2d(0.25) ] # 16x16
+        self.model_last = nn.Sequential(nn.Conv2d(self.base_nc*4+1, self.base_nc*8, 4, stride=2, padding=1),
+                                        nn.InstanceNorm2d(self.base_nc*8), 
+                                        nn.LeakyReLU(0.2),
+                                        nn.Dropout2d(0.25))# 8x8
+        # model += [  nn.Conv2d(self.base_nc*8, self.base_nc*16, 4, stride=2, padding=1),
+        #             nn.InstanceNorm2d(self.base_nc*16), 
+        #             nn.LeakyReLU(0.2, inplace=True),
+        #             nn.Dropout2d(0.25) ] # 4x4
         # FCN classification layer
-        model += [nn.Conv2d(self.base_nc*8, 1, 4, padding=1)]
-
+        # model += [nn.Conv2d(self.base_nc*16, 1, 4, stride=2, padding=0)]
+        self.classifier = nn.Linear(256, 1)
         self.model = nn.Sequential(*model)
 
+
+    def minibatch_std(self, x):
+        batch_statistics = (torch.std(x, dim=0).mean().repeat(x.shape[0], 1, x.shape[2], x.shape[3]))
+        # we take the std for each example (across all channels, and pixels) then we repeat it
+        # for a single channel and concatenate it with the image. In this way the discriminator
+        # will get information about the variation in the batch/image
+        return torch.cat([x, batch_statistics], dim=1)
+
+
     def forward(self, x):
-        x =  self.model(x)
-        # Average pooling and flatten
+        x = self.model(x)
+        x = self.minibatch_std(x)
+        x = self.model_last(x)
         x = F.avg_pool2d(x, x.size()[2:]).view(x.size()[0], -1)
+        x = self.classifier(x)
+        # Average pooling and flatten
+        # x = F.avg_pool2d(x, x.size()[2:]).view(x.size()[0], -1)
         return x
 
 
@@ -303,28 +323,46 @@ class Discriminator3D(nn.Module):
         self.base_nc = 32
         # A bunch of convolutions one after another
         model = [   nn.Conv3d(input_nc, self.base_nc, 4, stride=2, padding=1),
-                    nn.LeakyReLU(0.2) ]
-
+                    nn.LeakyReLU(0.2),
+                    nn.Dropout3d(0.25) ]
         model += [  nn.Conv3d(self.base_nc, self.base_nc*2, 4, stride=2, padding=1),
                     nn.InstanceNorm3d(self.base_nc*2), 
-                    nn.LeakyReLU(0.2) ]
-
+                    nn.LeakyReLU(0.2),
+                    nn.Dropout3d(0.25) ]
         model += [  nn.Conv3d(self.base_nc*2, self.base_nc*4, 4, stride=2, padding=1),
                     nn.InstanceNorm3d(self.base_nc*4), 
-                    nn.LeakyReLU(0.2) ]
+                    nn.LeakyReLU(0.2),
+                    nn.Dropout3d(0.25) ]
 
-        model += [  nn.Conv3d(self.base_nc*4, self.base_nc*8, 4, padding=1),
-                    nn.InstanceNorm3d(self.base_nc*8), 
-                    nn.LeakyReLU(0.2) ]
-
+        self.model_last = nn.Sequential(nn.Conv3d(self.base_nc*4+1, self.base_nc*8, 4, stride=2, padding=1),
+                                        nn.InstanceNorm3d(self.base_nc*8), 
+                                        nn.LeakyReLU(0.2),
+                                        nn.Dropout3d(0.25))
+        # model += [  nn.Conv3d(self.base_nc*8, self.base_nc*16, 4, stride=2, padding=1),
+        #             nn.InstanceNorm3d(self.base_nc*16), 
+        #             nn.LeakyReLU(0.2, inplace=True),
+        #             nn.Dropout3d(0.25) ]
         # FCN classification layer
-        model += [nn.Conv3d(self.base_nc*8, 1, 4, padding=1)]
-
+        # model += [nn.Conv3d(self.base_nc*16, 1, 4, stride=2, padding=0)]
+        self.classifier = nn.Linear(256, 1)
         self.model = nn.Sequential(*model)
 
+
+    def minibatch_std(self, x):
+        batch_statistics = (torch.std(x, dim=0).mean().repeat(x.shape[0], 1, x.shape[2], x.shape[3], x.shape[4]))
+        # we take the std for each example (across all channels, and pixels) then we repeat it
+        # for a single channel and concatenate it with the image. In this way the discriminator
+        # will get information about the variation in the batch/image
+        return torch.cat([x, batch_statistics], dim=1)
+
+
     def forward(self, x):
-        x =  self.model(x)
-        # Average pooling and flatten
+        x = self.model(x)
+        x = self.minibatch_std(x)
+        x = self.model_last(x)
         x = F.avg_pool3d(x, x.size()[2:]).view(x.size()[0], -1)
+        x = self.classifier(x)
+        # Average pooling and flatten
+        # x = F.avg_pool3d(x, x.size()[2:]).view(x.size()[0], -1)
         return x
 

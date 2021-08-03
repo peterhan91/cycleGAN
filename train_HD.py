@@ -221,10 +221,10 @@ for epoch in range(opt.epoch, opt.n_epochs):
         writer.add_scalar('2D_DLoss/'+'train', loss_D_A, train_iter)
         writer.add_scalar('3D_DLoss/'+'train', loss_D_B, train_iter)
         train_iter += 1
-        real_grid = torchvision.utils.make_grid((real_A+1)/2)
-        writer.add_image('Real X-rays', real_grid)
-        fake_grid = torchvision.utils.make_grid((fake_A+1)/2)
-        writer.add_image('Generated X-rays', fake_grid)
+        real_grid = torchvision.utils.make_grid((real_B[:,:,64]+1)/2)
+        writer.add_image('Real CTs', real_grid)
+        fake_grid = torchvision.utils.make_grid((fake_B[:,:,64]+1)/2)
+        writer.add_image('Generated CTs', fake_grid)
 
 
     # Update learning rates
